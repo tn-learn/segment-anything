@@ -252,6 +252,31 @@ def uncrop_points(points: torch.Tensor, crop_box: List[int]) -> torch.Tensor:
     return points + offset
 
 
+def sample_image(img: np.ndarray, points: np.ndarray) -> np.ndarray:
+    """
+    Samples the image `img` at the given `points`, returning an array of pixel values.
+
+    Parameters:
+    img (np.ndarray): An image array of shape (H, W).
+    points (np.ndarray): An array of shape (N, 2) containing (x, y) coordinates.
+
+    Returns:
+    np.ndarray: An array of shape (M,) containing the pixel values at the valid points in `points`.
+    """
+    # Round the points to the nearest integer
+    points = np.round(points).astype(int)
+
+    # Make sure the points are within the image bounds
+    valid_mask = (points[:, 0] >= 0) & (points[:, 0] < img.shape[1]) & \
+                 (points[:, 1] >= 0) & (points[:, 1] < img.shape[0])
+    valid_points = points[valid_mask]
+
+    # Sample the image at the valid points
+    samples = img[valid_points[:, 1], valid_points[:, 0]]
+
+    return samples
+
+
 def uncrop_masks(
     masks: torch.Tensor, crop_box: List[int], orig_h: int, orig_w: int
 ) -> torch.Tensor:

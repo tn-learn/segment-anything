@@ -29,6 +29,7 @@ from .utils.amg import (
     uncrop_boxes_xyxy,
     uncrop_masks,
     uncrop_points,
+    sample_image,
 )
 
 
@@ -49,6 +50,8 @@ class SamAutomaticMaskGenerator:
         point_grids: Optional[List[np.ndarray]] = None,
         min_mask_region_area: int = 0,
         output_mode: str = "binary_mask",
+        min_local_score_thresh_for_crop_skip: Optional[float] = None,
+        min_local_score_thresh_for_point_skip: Optional[float] = None,
     ) -> None:
         """
         Using a SAM model, generates masks for the entire image.
@@ -93,6 +96,10 @@ class SamAutomaticMaskGenerator:
             'uncompressed_rle', or 'coco_rle'. 'coco_rle' requires pycocotools.
             For large resolutions, 'binary_mask' may consume large amounts of
             memory.
+          min_local_score_thresh_for_crop_skip (float or None): If >0, crops will be
+            skipped if the mean local bias over the crop is below this threshold.
+          min_local_score_thresh_for_point_skip (float or None): If >0, points will be
+            skipped if the local bias at the point is below this threshold.
         """
 
         assert (points_per_side is None) != (
@@ -132,14 +139,24 @@ class SamAutomaticMaskGenerator:
         self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
         self.min_mask_region_area = min_mask_region_area
         self.output_mode = output_mode
+        self.min_local_score_thresh_for_crop_skip = min_local_score_thresh_for_crop_skip
+        self.min_local_score_thresh_for_point_skip = (
+            min_local_score_thresh_for_point_skip
+        )
 
     @torch.no_grad()
-    def generate(self, image: np.ndarray) -> List[Dict[str, Any]]:
+    def generate(
+        self,
+        image: np.ndarray,
+        local_score_bias: Optional[np.ndarray] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Generates masks for the given image.
 
         Arguments:
           image (np.ndarray): The image to generate masks for, in HWC uint8 format.
+          local_score_bias (np.ndarray): Extra bias for the IOU scores when computing NMS.
+            In HW float format.
 
         Returns:
            list(dict(str, any)): A list over records for masks. Each record is
@@ -160,7 +177,7 @@ class SamAutomaticMaskGenerator:
         """
 
         # Generate masks
-        mask_data = self._generate_masks(image)
+        mask_data = self._generate_masks(image, local_score_bias=local_score_bias)
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
@@ -172,7 +189,9 @@ class SamAutomaticMaskGenerator:
 
         # Encode masks
         if self.output_mode == "coco_rle":
-            mask_data["segmentations"] = [coco_encode_rle(rle) for rle in mask_data["rles"]]
+            mask_data["segmentations"] = [
+                coco_encode_rle(rle) for rle in mask_data["rles"]
+            ]
         elif self.output_mode == "binary_mask":
             mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
         else:
@@ -194,7 +213,11 @@ class SamAutomaticMaskGenerator:
 
         return curr_anns
 
-    def _generate_masks(self, image: np.ndarray) -> MaskData:
+    def _generate_masks(
+        self,
+        image: np.ndarray,
+        local_score_bias: Optional[np.ndarray] = None,
+    ) -> MaskData:
         orig_size = image.shape[:2]
         crop_boxes, layer_idxs = generate_crop_boxes(
             orig_size, self.crop_n_layers, self.crop_overlap_ratio
@@ -203,7 +226,9 @@ class SamAutomaticMaskGenerator:
         # Iterate over image crops
         data = MaskData()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
-            crop_data = self._process_crop(image, crop_box, layer_idx, orig_size)
+            crop_data = self._process_crop(
+                image, crop_box, layer_idx, orig_size, local_score_bias
+            )
             data.cat(crop_data)
 
         # Remove duplicate masks between crops
@@ -228,6 +253,7 @@ class SamAutomaticMaskGenerator:
         crop_box: List[int],
         crop_layer_idx: int,
         orig_size: Tuple[int, ...],
+        local_score_bias: Optional[np.ndarray] = None,
     ) -> MaskData:
         # Crop the image and calculate embeddings
         x0, y0, x1, y1 = crop_box
@@ -235,14 +261,45 @@ class SamAutomaticMaskGenerator:
         cropped_im_size = cropped_im.shape[:2]
         self.predictor.set_image(cropped_im)
 
+        # Crop the local score bias
+        if local_score_bias is not None:
+            # Skip crops with low local score bias, if requested
+            cropped_local_score_bias = local_score_bias[y0:y1, x0:x1]
+            if self.min_local_score_thresh_for_crop_skip is not None:
+                if (
+                    cropped_local_score_bias.max()
+                    < self.min_local_score_thresh_for_crop_skip
+                ):
+                    return MaskData()
+        else:
+            cropped_local_score_bias = None
+
         # Get points for this crop
         points_scale = np.array(cropped_im_size)[None, ::-1]
         points_for_image = self.point_grids[crop_layer_idx] * points_scale
 
+        # Filter if required
+        if (
+            cropped_local_score_bias is not None
+            and self.min_local_score_thresh_for_point_skip is not None
+        ):
+            local_scores_at_points = sample_image(
+                cropped_local_score_bias, points_for_image
+            )
+            assert local_scores_at_points.shape[0] == points_for_image.shape[0], (
+                f"Wrong number of points sampled: "
+                f"{local_scores_at_points.shape[0]} != {points_for_image.shape[0]}"
+            )
+            points_for_image = points_for_image[
+                local_scores_at_points > self.min_local_score_thresh_for_point_skip
+            ]
+
         # Generate masks for this crop in batches
         data = MaskData()
         for (points,) in batch_iterator(self.points_per_batch, points_for_image):
-            batch_data = self._process_batch(points, cropped_im_size, crop_box, orig_size)
+            batch_data = self._process_batch(
+                points, cropped_im_size, crop_box, orig_size
+            )
             data.cat(batch_data)
             del batch_data
         self.predictor.reset_image()
@@ -275,7 +332,9 @@ class SamAutomaticMaskGenerator:
         # Run model on this batch
         transformed_points = self.predictor.transform.apply_coords(points, im_size)
         in_points = torch.as_tensor(transformed_points, device=self.predictor.device)
-        in_labels = torch.ones(in_points.shape[0], dtype=torch.int, device=in_points.device)
+        in_labels = torch.ones(
+            in_points.shape[0], dtype=torch.int, device=in_points.device
+        )
         masks, iou_preds, _ = self.predictor.predict_torch(
             in_points[:, None, :],
             in_labels[:, None],
@@ -291,6 +350,8 @@ class SamAutomaticMaskGenerator:
         )
         del masks
 
+        # TODO: Add an additional filter that looks at the integral of the score bias.
+
         # Filter by predicted IoU
         if self.pred_iou_thresh > 0.0:
             keep_mask = data["iou_preds"] > self.pred_iou_thresh
@@ -298,7 +359,9 @@ class SamAutomaticMaskGenerator:
 
         # Calculate stability score
         data["stability_score"] = calculate_stability_score(
-            data["masks"], self.predictor.model.mask_threshold, self.stability_score_offset
+            data["masks"],
+            self.predictor.model.mask_threshold,
+            self.stability_score_offset,
         )
         if self.stability_score_thresh > 0.0:
             keep_mask = data["stability_score"] >= self.stability_score_thresh
@@ -309,7 +372,9 @@ class SamAutomaticMaskGenerator:
         data["boxes"] = batched_mask_to_box(data["masks"])
 
         # Filter boxes that touch crop boundaries
-        keep_mask = ~is_box_near_crop_edge(data["boxes"], crop_box, [0, 0, orig_w, orig_h])
+        keep_mask = ~is_box_near_crop_edge(
+            data["boxes"], crop_box, [0, 0, orig_w, orig_h]
+        )
         if not torch.all(keep_mask):
             data.filter(keep_mask)
 
