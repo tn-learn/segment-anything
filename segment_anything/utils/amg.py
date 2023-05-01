@@ -134,6 +134,18 @@ def mask_to_rle_pytorch(tensor: torch.Tensor) -> List[Dict[str, Any]]:
         out.append({"size": [h, w], "counts": counts})
     return out
 
+def rle_to_mask_torch(rle: Dict[str, Any], device="cuda") -> torch.Tensor:
+    """Compute a binary mask from an uncompressed RLE and return it as a torch tensor on CUDA."""
+    h, w = rle["size"]
+    mask = torch.empty(h * w, dtype=torch.bool, device=device)
+    idx = 0
+    parity = False
+    for count in rle["counts"]:
+        mask[idx : idx + count] = parity
+        idx += count
+        parity ^= True
+    mask = mask.view(w, h).t()  # Put in C order
+    return mask
 
 def rle_to_mask(rle: Dict[str, Any]) -> np.ndarray:
     """Compute a binary mask from an uncompressed RLE."""

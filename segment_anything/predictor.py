@@ -55,7 +55,8 @@ class SamPredictor:
         # Transform the image to the form expected by the model
         input_image = self.transform.apply_image(image)
         input_image_torch = torch.as_tensor(input_image, device=self.device)
-        input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
+        # input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
+        input_image_torch = input_image_torch.contiguous()[None, :, :, :]
 
         self.set_torch_image(input_image_torch, image.shape[:2])
 

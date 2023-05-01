@@ -26,6 +26,7 @@ from .utils.amg import (
     mask_to_rle_pytorch,
     remove_small_regions,
     rle_to_mask,
+    rle_to_mask_torch,
     uncrop_boxes_xyxy,
     uncrop_masks,
     uncrop_points,
@@ -193,7 +194,7 @@ class SamAutomaticMaskGenerator:
                 coco_encode_rle(rle) for rle in mask_data["rles"]
             ]
         elif self.output_mode == "binary_mask":
-            mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
+            mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]] 
         else:
             mask_data["segmentations"] = mask_data["rles"]
 
@@ -244,7 +245,7 @@ class SamAutomaticMaskGenerator:
             )
             data.filter(keep_by_nms)
 
-        data.to_numpy()
+        # data.to_numpy()
         return data
 
     def _process_crop(

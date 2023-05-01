@@ -11,6 +11,7 @@ from torchvision.transforms.functional import resize, to_pil_image  # type: igno
 
 from copy import deepcopy
 from typing import Tuple
+import einops as eo
 
 
 class ResizeLongestSide:
@@ -28,7 +29,8 @@ class ResizeLongestSide:
         Expects a numpy array with shape HxWxC in uint8 format.
         """
         target_size = self.get_preprocess_shape(image.shape[0], image.shape[1], self.target_length)
-        return np.array(resize(to_pil_image(image), target_size))
+        return resize(eo.rearrange(image, "h w c -> c h w"), target_size)
+
 
     def apply_coords(self, coords: np.ndarray, original_size: Tuple[int, ...]) -> np.ndarray:
         """
