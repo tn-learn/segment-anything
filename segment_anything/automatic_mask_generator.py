@@ -245,7 +245,7 @@ class SamAutomaticMaskGenerator:
             )
             data.filter(keep_by_nms)
 
-        # data.to_numpy()
+        data.to_numpy()
         return data
 
     def _process_crop(
@@ -260,7 +260,6 @@ class SamAutomaticMaskGenerator:
         x0, y0, x1, y1 = crop_box
         cropped_im = image[y0:y1, x0:x1, :]
         cropped_im_size = cropped_im.shape[:2]
-        self.predictor.set_image(cropped_im)
 
         # Crop the local score bias
         if local_score_bias is not None:
@@ -274,6 +273,9 @@ class SamAutomaticMaskGenerator:
                     return MaskData()
         else:
             cropped_local_score_bias = None
+
+        # This is heavy compute
+        self.predictor.set_image(cropped_im)
 
         # Get points for this crop
         points_scale = np.array(cropped_im_size)[None, ::-1]
