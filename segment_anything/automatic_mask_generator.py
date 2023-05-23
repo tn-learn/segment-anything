@@ -31,6 +31,7 @@ from .utils.amg import (
     uncrop_masks,
     uncrop_points,
     sample_image,
+    FeatureCache,
 )
 
 
@@ -53,6 +54,7 @@ class SamAutomaticMaskGenerator:
         output_mode: str = "binary_mask",
         min_local_score_thresh_for_crop_skip: Optional[float] = None,
         min_local_score_thresh_for_point_skip: Optional[float] = None,
+        feature_cache_size: Optional[int] = None,
     ) -> None:
         """
         Using a SAM model, generates masks for the entire image.
@@ -101,6 +103,11 @@ class SamAutomaticMaskGenerator:
             skipped if the mean local bias over the crop is below this threshold.
           min_local_score_thresh_for_point_skip (float or None): If >0, points will be
             skipped if the local bias at the point is below this threshold.
+          feature_cache_size (int or None): If not None, the feature cache will be
+            used to store features for each image and crop. This can speed up
+            inference if the same image and crop is used multiple times. The cache
+            will store up to feature_cache_size images. If None, the cache will not
+            be used.
         """
 
         assert (points_per_side is None) != (
@@ -144,12 +151,19 @@ class SamAutomaticMaskGenerator:
         self.min_local_score_thresh_for_point_skip = (
             min_local_score_thresh_for_point_skip
         )
+        self.feature_cache_size = feature_cache_size
+        # Init the cache
+        if feature_cache_size is not None and feature_cache_size > 0:
+            self.feature_cache = FeatureCache(max_cache_size=feature_cache_size)
+        else:
+            self.feature_cache = None
 
     @torch.no_grad()
     def generate(
         self,
         image: np.ndarray,
         local_score_bias: Optional[np.ndarray] = None,
+        feature_cache: Optional[FeatureCache] = None,
     ) -> List[Dict[str, Any]]:
         """
         Generates masks for the given image.
@@ -158,6 +172,10 @@ class SamAutomaticMaskGenerator:
           image (np.ndarray): The image to generate masks for, in HWC uint8 format.
           local_score_bias (np.ndarray): Extra bias for the IOU scores when computing NMS.
             In HW float format.
+          feature_cache (FeatureCache): A cache of features for the image. If provided,
+            the model will not recompute features for the image if it's found in the cache.
+            If not provided, the internal feature cache will be used, if defined. If no
+            internal feature cache is defined, features will be recomputed.
 
         Returns:
            list(dict(str, any)): A list over records for masks. Each record is
@@ -178,7 +196,11 @@ class SamAutomaticMaskGenerator:
         """
 
         # Generate masks
-        mask_data = self._generate_masks(image, local_score_bias=local_score_bias)
+        mask_data = self._generate_masks(
+            image,
+            local_score_bias=local_score_bias,
+            feature_cache=(feature_cache or self.feature_cache),
+        )
 
         # Filter small disconnected regions and holes in masks
         if self.min_mask_region_area > 0:
@@ -194,7 +216,7 @@ class SamAutomaticMaskGenerator:
                 coco_encode_rle(rle) for rle in mask_data["rles"]
             ]
         elif self.output_mode == "binary_mask":
-            mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]] 
+            mask_data["segmentations"] = [rle_to_mask(rle) for rle in mask_data["rles"]]
         else:
             mask_data["segmentations"] = mask_data["rles"]
 
@@ -218,6 +240,7 @@ class SamAutomaticMaskGenerator:
         self,
         image: np.ndarray,
         local_score_bias: Optional[np.ndarray] = None,
+        feature_cache: Optional[FeatureCache] = None,
     ) -> MaskData:
         orig_size = image.shape[:2]
         crop_boxes, layer_idxs = generate_crop_boxes(
@@ -228,12 +251,17 @@ class SamAutomaticMaskGenerator:
         data = MaskData()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
             crop_data = self._process_crop(
-                image, crop_box, layer_idx, orig_size, local_score_bias
+                image=image,
+                crop_box=crop_box,
+                crop_layer_idx=layer_idx,
+                orig_size=orig_size,
+                local_score_bias=local_score_bias,
+                feature_cache=feature_cache,
             )
             data.cat(crop_data)
 
         # Remove duplicate masks between crops
-        if len(crop_boxes) > 1:
+        if len(crop_boxes) > 1 and len(data) > 0:
             # Prefer masks from smaller crops
             scores = 1 / box_area(data["crop_boxes"])
             scores = scores.to(data["boxes"].device)
@@ -255,6 +283,7 @@ class SamAutomaticMaskGenerator:
         crop_layer_idx: int,
         orig_size: Tuple[int, ...],
         local_score_bias: Optional[np.ndarray] = None,
+        feature_cache: Optional[FeatureCache] = None,
     ) -> MaskData:
         # Crop the image and calculate embeddings
         x0, y0, x1, y1 = crop_box
@@ -273,9 +302,6 @@ class SamAutomaticMaskGenerator:
                     return MaskData()
         else:
             cropped_local_score_bias = None
-
-        # This is heavy compute
-        self.predictor.set_image(cropped_im)
 
         # Get points for this crop
         points_scale = np.array(cropped_im_size)[None, ::-1]
@@ -296,6 +322,28 @@ class SamAutomaticMaskGenerator:
             points_for_image = points_for_image[
                 local_scores_at_points > self.min_local_score_thresh_for_point_skip
             ]
+
+        # It's possible that we filtered out all points
+        if points_for_image.shape[0] == 0:
+            return MaskData()
+
+        # Functions for caching features
+        if feature_cache is not None:
+            feature_retriever = feature_cache.get_retriever_for_image_and_crop_box(
+                cropped_im, crop_box
+            )
+            feature_cacher = feature_cache.get_cacher_for_image_and_crop_box(
+                cropped_im, crop_box
+            )
+        else:
+            feature_retriever = None
+            feature_cacher = None
+        # This is heavy compute
+        self.predictor.set_image(
+            cropped_im,
+            feature_retriever=feature_retriever,
+            feature_cacher=feature_cacher,
+        )
 
         # Generate masks for this crop in batches
         data = MaskData()
@@ -438,3 +486,7 @@ class SamAutomaticMaskGenerator:
         mask_data.filter(keep_by_nms)
 
         return mask_data
+
+    def clear_feature_cache(self) -> None:
+        if self.feature_cache is not None:
+            self.feature_cache.clear()

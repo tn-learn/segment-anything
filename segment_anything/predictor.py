@@ -9,7 +9,7 @@ import torch
 
 from segment_anything.modeling import Sam
 
-from typing import Optional, Tuple
+from typing import Optional, Tuple, Callable
 
 from .utils.transforms import ResizeLongestSide
 
@@ -35,6 +35,8 @@ class SamPredictor:
         self,
         image: np.ndarray,
         image_format: str = "RGB",
+        feature_retriever: Optional[Callable] = None,
+        feature_cacher: Optional[Callable] = None,
     ) -> None:
         """
         Calculates the image embeddings for the provided image, allowing
@@ -44,6 +46,11 @@ class SamPredictor:
           image (np.ndarray): The image for calculating masks. Expects an
             image in HWC uint8 format, with pixel values in [0, 255].
           image_format (str): The color format of the image, in ['RGB', 'BGR'].
+          feature_retriever (Callable): A function that takes in the image and
+            returns precomputed features, if available. This function returns
+            None if no features are available in cache.
+          feature_cacher (Callable): A function that takes in the features and
+            the sizes and caches for future retrieval.
         """
         assert image_format in [
             "RGB",
@@ -51,19 +58,35 @@ class SamPredictor:
         ], f"image_format must be in ['RGB', 'BGR'], is {image_format}."
         if image_format != self.model.image_format:
             image = image[..., ::-1]
-
-        # Transform the image to the form expected by the model
-        input_image = self.transform.apply_image(image)
-        input_image_torch = torch.as_tensor(input_image, device=self.device)
-        input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[None, :, :, :]
-
-        self.set_torch_image(input_image_torch, image.shape[:2])
+        # Retrieve precomputed features if available
+        feature_spec = feature_retriever() if feature_retriever is not None else None
+        if feature_spec is None:
+            # This is the default codepath
+            # Transform the image to the form expected by the model
+            input_image = self.transform.apply_image(image)
+            input_image_torch = torch.as_tensor(input_image, device=self.device)
+            input_image_torch = input_image_torch.permute(2, 0, 1).contiguous()[
+                None, :, :, :
+            ]
+            self.set_torch_image(
+                transformed_image=input_image_torch,
+                original_image_size=image.shape[:2],
+                feature_cacher=feature_cacher,
+            )
+        else:
+            # This is a special codepath for when features are precomputed
+            self.set_torch_features(
+                features=feature_spec["features"],
+                original_size=feature_spec["original_size"],
+                input_size=feature_spec["input_size"],
+            )
 
     @torch.no_grad()
     def set_torch_image(
         self,
         transformed_image: torch.Tensor,
         original_image_size: Tuple[int, ...],
+        feature_cacher: Optional[Callable] = None,
     ) -> None:
         """
         Calculates the image embeddings for the provided image, allowing
@@ -75,6 +98,8 @@ class SamPredictor:
             1x3xHxW, which has been transformed with ResizeLongestSide.
           original_image_size (tuple(int, int)): The size of the image
             before transformation, in (H, W) format.
+          feature_cacher (Callable): A function that takes in the features and
+            the sizes and caches for future retrieval.
         """
         assert (
             len(transformed_image.shape) == 4
@@ -87,6 +112,25 @@ class SamPredictor:
         self.input_size = tuple(transformed_image.shape[-2:])
         input_image = self.model.preprocess(transformed_image)
         self.features = self.model.image_encoder(input_image)
+        self.is_image_set = True
+        if feature_cacher is not None:
+            feature_cacher(
+                features=self.features,
+                original_size=self.original_size,
+                input_size=self.input_size,
+            )
+
+    def set_torch_features(
+        self,
+        features: torch.Tensor,
+        original_size: Tuple[int, int],
+        input_size: Tuple[int, int],
+    ) -> None:
+        self.reset_image()
+        # This spoofs set_torch_image, but without the image processing.
+        self.original_size = original_size
+        self.input_size = input_size
+        self.features = features
         self.is_image_set = True
 
     def predict(
@@ -131,7 +175,9 @@ class SamPredictor:
             a subsequent iteration as mask input.
         """
         if not self.is_image_set:
-            raise RuntimeError("An image must be set with .set_image(...) before mask prediction.")
+            raise RuntimeError(
+                "An image must be set with .set_image(...) before mask prediction."
+            )
 
         # Transform input prompts
         coords_torch, labels_torch, box_torch, mask_input_torch = None, None, None, None
@@ -140,15 +186,21 @@ class SamPredictor:
                 point_labels is not None
             ), "point_labels must be supplied if point_coords is supplied."
             point_coords = self.transform.apply_coords(point_coords, self.original_size)
-            coords_torch = torch.as_tensor(point_coords, dtype=torch.float, device=self.device)
-            labels_torch = torch.as_tensor(point_labels, dtype=torch.int, device=self.device)
+            coords_torch = torch.as_tensor(
+                point_coords, dtype=torch.float, device=self.device
+            )
+            labels_torch = torch.as_tensor(
+                point_labels, dtype=torch.int, device=self.device
+            )
             coords_torch, labels_torch = coords_torch[None, :, :], labels_torch[None, :]
         if box is not None:
             box = self.transform.apply_boxes(box, self.original_size)
             box_torch = torch.as_tensor(box, dtype=torch.float, device=self.device)
             box_torch = box_torch[None, :]
         if mask_input is not None:
-            mask_input_torch = torch.as_tensor(mask_input, dtype=torch.float, device=self.device)
+            mask_input_torch = torch.as_tensor(
+                mask_input, dtype=torch.float, device=self.device
+            )
             mask_input_torch = mask_input_torch[None, :, :, :]
 
         masks, iou_predictions, low_res_masks = self.predict_torch(
@@ -211,7 +263,9 @@ class SamPredictor:
             a subsequent iteration as mask input.
         """
         if not self.is_image_set:
-            raise RuntimeError("An image must be set with .set_image(...) before mask prediction.")
+            raise RuntimeError(
+                "An image must be set with .set_image(...) before mask prediction."
+            )
 
         if point_coords is not None:
             points = (point_coords, point_labels)
@@ -235,7 +289,9 @@ class SamPredictor:
         )
 
         # Upscale the masks to the original image resolution
-        masks = self.model.postprocess_masks(low_res_masks, self.input_size, self.original_size)
+        masks = self.model.postprocess_masks(
+            low_res_masks, self.input_size, self.original_size
+        )
 
         if not return_logits:
             masks = masks > self.model.mask_threshold
@@ -252,7 +308,9 @@ class SamPredictor:
             raise RuntimeError(
                 "An image must be set with .set_image(...) to generate an embedding."
             )
-        assert self.features is not None, "Features must exist if an image has been set."
+        assert (
+            self.features is not None
+        ), "Features must exist if an image has been set."
         return self.features
 
     @property

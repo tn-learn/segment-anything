@@ -1,8 +1,11 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 # All rights reserved.
-
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
+
+import hashlib
+from dataclasses import dataclass, field
+from functools import partial
 
 import numpy as np
 import torch
@@ -10,7 +13,7 @@ import torch
 import math
 from copy import deepcopy
 from itertools import product
-from typing import Any, Dict, Generator, ItemsView, List, Tuple
+from typing import Any, Dict, Generator, ItemsView, List, Tuple, Union, Callable
 
 
 class MaskData:
@@ -74,6 +77,15 @@ class MaskData:
             if isinstance(v, torch.Tensor):
                 self._stats[k] = v.detach().cpu().numpy()
 
+    def __len__(self):
+        lens = [len(v) for v in self._stats.values()]
+        if len(lens) == 0:
+            return 0
+        assert all(
+            l == lens[0] for l in lens
+        ), "All MaskData fields must have the same length."
+        return lens[0]
+
 
 def is_box_near_crop_edge(
     boxes: torch.Tensor, crop_box: List[int], orig_box: List[int], atol: float = 20.0
@@ -134,6 +146,7 @@ def mask_to_rle_pytorch(tensor: torch.Tensor) -> List[Dict[str, Any]]:
         out.append({"size": [h, w], "counts": counts})
     return out
 
+
 def rle_to_mask_torch(rle: Dict[str, Any], device="cuda") -> torch.Tensor:
     """Compute a binary mask from an uncompressed RLE and return it as a torch tensor on CUDA."""
     h, w = rle["size"]
@@ -146,6 +159,7 @@ def rle_to_mask_torch(rle: Dict[str, Any], device="cuda") -> torch.Tensor:
         parity ^= True
     mask = mask.view(w, h).t()  # Put in C order
     return mask
+
 
 def rle_to_mask(rle: Dict[str, Any]) -> np.ndarray:
     """Compute a binary mask from an uncompressed RLE."""
@@ -204,7 +218,7 @@ def build_all_layer_point_grids(
     """Generates point grids for all crop layers."""
     points_by_layer = []
     for i in range(n_layers + 1):
-        n_points = int(n_per_side / (scale_per_layer**i))
+        n_points = int(n_per_side / (scale_per_layer ** i))
         points_by_layer.append(build_point_grid(n_points))
     return points_by_layer
 
@@ -279,8 +293,12 @@ def sample_image(img: np.ndarray, points: np.ndarray) -> np.ndarray:
     points = np.round(points).astype(int)
 
     # Make sure the points are within the image bounds
-    valid_mask = (points[:, 0] >= 0) & (points[:, 0] < img.shape[1]) & \
-                 (points[:, 1] >= 0) & (points[:, 1] < img.shape[0])
+    valid_mask = (
+        (points[:, 0] >= 0)
+        & (points[:, 0] < img.shape[1])
+        & (points[:, 1] >= 0)
+        & (points[:, 1] < img.shape[0])
+    )
     valid_points = points[valid_mask]
 
     # Sample the image at the valid points
@@ -381,3 +399,94 @@ def batched_mask_to_box(masks: torch.Tensor) -> torch.Tensor:
         out = out[0]
 
     return out
+
+
+@dataclass
+class FeatureSpec:
+    features: torch.Tensor
+    original_size: Tuple[int, int]
+    input_size: Tuple[int, int]
+
+    def __getitem__(self, item):
+        if isinstance(item, str):
+            return getattr(self, item)
+        else:
+            raise KeyError(f"FeatureSpec does not have attribute {item}")
+
+
+@dataclass
+class FeatureCache:
+    cached_features: Dict[str, FeatureSpec] = field(default_factory=dict)
+    hashing_decimals: int = 6
+    max_cache_size: int = 10000
+
+    @staticmethod
+    def _array_hash(x: Union[torch.Tensor, np.ndarray], decimals=6) -> str:
+        """Hashes a numpy array."""
+        if torch.is_tensor(x):
+            x = x.detach().cpu().numpy()
+        return hashlib.sha256(np.round(x, decimals).tobytes()).hexdigest()
+
+    def make_key(self, image: Union[torch.Tensor, np.ndarray], crop_box: List[int]):
+        image_hash = self._array_hash(image, decimals=self.hashing_decimals)
+        crop_box_str = ",".join([str(x) for x in crop_box])
+        return f"{image_hash}_{crop_box_str}"
+
+    def store(
+        self,
+        image: Union[torch.Tensor, np.ndarray],
+        crop_box: List[int],
+        features: FeatureSpec,
+    ):
+        """Stores a feature in cache."""
+        # First, hash the image
+        key = self.make_key(image, crop_box)
+        self.cached_features[key] = features
+        # If the cache is too large, remove the oldest entry
+        if len(self.cached_features) > self.max_cache_size:
+            first_key = next(iter(self.cached_features.keys()))
+            self.cached_features.pop(first_key)
+
+    def build_feature_spec_and_store(
+        self,
+        image: Union[torch.Tensor, np.ndarray],
+        crop_box: List[int],
+        features: torch.Tensor,
+        input_size: Tuple[int, int],
+        original_size: Tuple[int, int],
+    ):
+        feature_spec = FeatureSpec(
+            features=features,
+            input_size=input_size,
+            original_size=original_size,
+        )
+        self.store(image, crop_box, feature_spec)
+
+    def get(
+        self,
+        image: Union[torch.Tensor, np.ndarray],
+        crop_box: List[int],
+        default: Any = None,
+    ) -> Union[FeatureSpec, Any]:
+        """Gets a feature from cache."""
+        key = self.make_key(image, crop_box)
+        return self.cached_features.get(key, default)
+
+    def clear(self):
+        """Clears the cache."""
+        self.cached_features = {}
+
+    def __len__(self):
+        return len(self.cached_features)
+
+    def get_retriever_for_image_and_crop_box(
+        self, image: Union[torch.Tensor, np.ndarray], crop_box: List[int]
+    ) -> Callable:
+        return partial(self.get, image=image, crop_box=crop_box, default=None)
+
+    def get_cacher_for_image_and_crop_box(
+        self, image: Union[torch.Tensor, np.ndarray], crop_box: List[int]
+    ) -> Callable:
+        return partial(
+            self.build_feature_spec_and_store, image=image, crop_box=crop_box
+        )
