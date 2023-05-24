@@ -13,7 +13,7 @@ import torch
 import math
 from copy import deepcopy
 from itertools import product
-from typing import Any, Dict, Generator, ItemsView, List, Tuple, Union, Callable
+from typing import Any, Dict, Generator, ItemsView, List, Tuple, Union, Callable, Optional
 
 
 class MaskData:
@@ -258,6 +258,33 @@ def generate_crop_boxes(
             layer_idxs.append(i_layer + 1)
 
     return crop_boxes, layer_idxs
+
+
+def filter_crop_boxes_by_area(
+    crop_boxes: List[List[int]],
+    layer_idxs: List[int],
+    min_area: Optional[int] = None,
+    max_area: Optional[int] = None,
+) -> Tuple[List[List[int]], List[int]]:
+    """
+    Prunes crop boxes that are too large or too small. This is done
+    to prevent the model from predicting masks that are too large or
+    too small.
+    """
+    if min_area is None and max_area is None:
+        return crop_boxes, layer_idxs
+    if min_area is None:
+        min_area = 0
+    if max_area is None:
+        max_area = float("inf")
+    new_crop_boxes, new_layer_idxs = [], []
+    for box, layer_idx in zip(crop_boxes, layer_idxs):
+        x0, y0, x1, y1 = box
+        area = (x1 - x0) * (y1 - y0)
+        if min_area <= area <= max_area:
+            new_crop_boxes.append(box)
+            new_layer_idxs.append(layer_idx)
+    return new_crop_boxes, new_layer_idxs
 
 
 def uncrop_boxes_xyxy(boxes: torch.Tensor, crop_box: List[int]) -> torch.Tensor:

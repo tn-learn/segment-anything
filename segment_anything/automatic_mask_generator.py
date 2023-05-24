@@ -31,7 +31,7 @@ from .utils.amg import (
     uncrop_masks,
     uncrop_points,
     sample_image,
-    FeatureCache,
+    FeatureCache, filter_crop_boxes_by_area,
 )
 
 
@@ -49,6 +49,8 @@ class SamAutomaticMaskGenerator:
         crop_nms_thresh: float = 0.7,
         crop_overlap_ratio: float = 512 / 1500,
         crop_n_points_downscale_factor: int = 1,
+        crop_max_area: Optional[int] = None,
+        crop_min_area: Optional[int] = None,
         point_grids: Optional[List[np.ndarray]] = None,
         min_mask_region_area: int = 0,
         output_mode: str = "binary_mask",
@@ -89,6 +91,10 @@ class SamAutomaticMaskGenerator:
             the image length. Later layers with more crops scale down this overlap.
           crop_n_points_downscale_factor (int): The number of points-per-side
             sampled in layer n is scaled down by crop_n_points_downscale_factor**n.
+          crop_max_area (int or None): If not None, crops will be filtered
+            if their area is larger than crop_max_area.
+          crop_min_area (int or None): If not None, crops will be filtered
+            if their area is smaller than crop_min_area.
           point_grids (list(np.ndarray) or None): A list over explicit grids
             of points used for sampling, normalized to [0,1]. The nth grid in the
             list is used in the nth crop layer. Exclusive with points_per_side.
@@ -145,6 +151,8 @@ class SamAutomaticMaskGenerator:
         self.crop_nms_thresh = crop_nms_thresh
         self.crop_overlap_ratio = crop_overlap_ratio
         self.crop_n_points_downscale_factor = crop_n_points_downscale_factor
+        self.crop_max_area = crop_max_area
+        self.crop_min_area = crop_min_area
         self.min_mask_region_area = min_mask_region_area
         self.output_mode = output_mode
         self.min_local_score_thresh_for_crop_skip = min_local_score_thresh_for_crop_skip
@@ -246,7 +254,13 @@ class SamAutomaticMaskGenerator:
         crop_boxes, layer_idxs = generate_crop_boxes(
             orig_size, self.crop_n_layers, self.crop_overlap_ratio
         )
-
+        # Filter the crops
+        crop_boxes, layer_idxs = filter_crop_boxes_by_area(
+            crop_boxes,
+            layer_idxs,
+            min_area=self.crop_min_area,
+            max_area=self.crop_max_area,
+        )
         # Iterate over image crops
         data = MaskData()
         for crop_box, layer_idx in zip(crop_boxes, layer_idxs):
